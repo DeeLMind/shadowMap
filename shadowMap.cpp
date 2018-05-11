@@ -5,11 +5,28 @@
 
 #include "shadowMap.h"
 
+#define MAX_SECTION	28
 
+static
+PVOID		g_mapAddress = NULL;
 
-PVOID							g_mapAddress;
-std::vector<SHADOW_MAP_TABLE>	g_mapTable;
+static
+ULONG_PTR	mapAddress[MAX_SECTION] = { 0 };
 
+static
+ULONG		mapSize[MAX_SECTION] = { 0 };
+
+static
+ULONG_PTR	realAddress[MAX_SECTION] = { 0 };
+
+static
+ULONG		realSize[MAX_SECTION] = { 0 };
+
+static
+DWORD		oldProtect[MAX_SECTION] = { 0 };
+
+static
+size_t		section_count = 0;
 
 /**
  * VEH
@@ -18,44 +35,44 @@ LONG WINAPI VEH(PEXCEPTION_POINTERS ExceptionInfo)
 {
 	PVOID	crashAddr = ExceptionInfo->ExceptionRecord->ExceptionAddress;
 
-	for (auto secinfo : g_mapTable)
+	for (size_t i = 0; i < section_count; i++)
 	{
-		if (secinfo.realAddress <= (ULONG_PTR)crashAddr &&
-			(secinfo.realAddress + secinfo.realSize) >= (ULONG_PTR)crashAddr)
+		if (realAddress[i] <= (ULONG_PTR)crashAddr &&
+			(realAddress[i] + realSize[i]) >= (ULONG_PTR)crashAddr)
 		{
 
 #ifdef _WIN64
 			ExceptionInfo->ContextRecord->Rip = \
-				(ULONG_PTR)crashAddr - secinfo.realAddress + secinfo.mapAddress;
+				(ULONG_PTR)crashAddr - realAddress[i] + mapAddress[i];
 #else
 			ExceptionInfo->ContextRecord->Eip = \
-				(ULONG_PTR)crashAddr - secinfo.realAddress + secinfo.mapAddress;
+				(ULONG_PTR)crashAddr - realAddress[i] + mapAddress[i];
 #endif
-			
+
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 
-		
-		if (secinfo.mapAddress <= (ULONG_PTR)crashAddr &&
-			(secinfo.mapAddress + secinfo.mapSize) >= (ULONG_PTR)crashAddr)
+
+		if (mapAddress[i] <= (ULONG_PTR)crashAddr &&
+			(mapAddress[i] + mapSize[i]) >= (ULONG_PTR)crashAddr)
 		{
 
 #ifdef _WIN64
 			ExceptionInfo->ContextRecord->Rip = \
-				(ULONG_PTR)crashAddr - secinfo.mapAddress + secinfo.realAddress;
+				(ULONG_PTR)crashAddr - mapAddress[i] + realAddress[i];
 			ExceptionInfo->ExceptionRecord->ExceptionAddress = (PVOID) \
-				((ULONG_PTR)crashAddr - secinfo.mapAddress + secinfo.realAddress);
+				((ULONG_PTR)crashAddr - mapAddress[i] + realAddress[i]);
 
 #else
 			ExceptionInfo->ContextRecord->Eip = \
-				(ULONG_PTR)crashAddr - secinfo.mapAddress + secinfo.realAddress;
+				(ULONG_PTR)crashAddr - mapAddress[i] + realAddress[i];
 			ExceptionInfo->ExceptionRecord->ExceptionAddress = (PVOID) \
-				((ULONG_PTR)crashAddr - secinfo.mapAddress + secinfo.realAddress);
+				((ULONG_PTR)crashAddr - mapAddress[i] + realAddress[i]);
 #endif
 
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
-		
+
 	}
 
 	return EXCEPTION_CONTINUE_SEARCH;
@@ -72,8 +89,8 @@ BOOL WINAPI shadowMap_InstallHook(HMODULE hModule)
 	PIMAGE_DOS_HEADER		doshead_ptr;
 	PIMAGE_NT_HEADERS		nthead_ptr;
 	PIMAGE_SECTION_HEADER	sec_ptr;
-	SHADOW_MAP_TABLE		shadow_section;
 	HANDLE					hProcess;
+	DWORD					protect;
 
 	doshead_ptr = (PIMAGE_DOS_HEADER)hModule;
 	if (doshead_ptr->e_magic != IMAGE_DOS_SIGNATURE)
@@ -93,44 +110,70 @@ BOOL WINAPI shadowMap_InstallHook(HMODULE hModule)
 		return FALSE;
 	}
 
+	//
+	//获取首个区段
+	//
+
 	sec_ptr = IMAGE_FIRST_SECTION(nthead_ptr);
 
-	g_mapTable.clear();
-	AddVectoredExceptionHandler(0, VEH);
-	hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
+	//
+	//添加VEH异常
+	//
 
+	AddVectoredExceptionHandler(0, VEH);
+
+	section_count = 0;
 	for (int i = 0; i < nthead_ptr->FileHeader.NumberOfSections; i++)
 	{
 		if (sec_ptr->Characteristics & IMAGE_SCN_MEM_EXECUTE)
 		{
-			shadow_section.mapAddress = (ULONG_PTR)g_mapAddress + sec_ptr->VirtualAddress;
-			shadow_section.mapSize = sec_ptr->Misc.VirtualSize;
-			shadow_section.realAddress = (ULONG_PTR)hModule + sec_ptr->VirtualAddress;
-			shadow_section.realSize = sec_ptr->Misc.VirtualSize;
-			shadow_section.oldProtect = sec_ptr->Characteristics;
+			mapAddress[section_count] = (ULONG_PTR)g_mapAddress + sec_ptr->VirtualAddress;
+			mapSize[section_count] = sec_ptr->Misc.VirtualSize;
+			realAddress[section_count] = (ULONG_PTR)hModule + sec_ptr->VirtualAddress;
+			realSize[section_count] = sec_ptr->Misc.VirtualSize;
+			oldProtect[section_count] = sec_ptr->Characteristics;
 
-			memcpy((void*)shadow_section.mapAddress,
-				   (void*)shadow_section.realAddress,
+			memcpy((void*)mapAddress[section_count],
+				   (void*)realAddress[section_count],
 				   sec_ptr->Misc.VirtualSize);
 
-
-
-			g_mapTable.push_back(shadow_section);
+			section_count++;
+			
 		}
 		sec_ptr++;
 	}
 
 
-	for (auto secinfo:g_mapTable)
+
+	//
+	//绕过VMP3.X 内存保护
+	//
+
+	hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
+	if (hProcess != NULL)
 	{
-		VirtualProtectEx(hProcess, (LPVOID)secinfo.realAddress,
-						 secinfo.realSize,
-						 PAGE_READONLY,
-						 &secinfo.oldProtect);
+		for (size_t i = 0; i < section_count; i++)
+		{
+			protect = PAGE_READWRITE;
+			VirtualProtectEx(hProcess, (LPVOID)realAddress[i],
+							 realSize[i],
+							 protect,
+							 &oldProtect[i]);
+		}
+		CloseHandle(hProcess);
 	}
-
-	CloseHandle(hProcess);
-
+	else
+	{
+		for (size_t i = 0; i < section_count; i++)
+		{
+			protect = PAGE_READWRITE;
+			VirtualProtectEx((HANDLE)-1, (LPVOID)realAddress[i],
+							 realSize[i],
+							 protect,
+							 &oldProtect[i]);
+		}
+	
+	}
 	return TRUE;
 }
 

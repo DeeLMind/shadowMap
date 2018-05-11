@@ -2,15 +2,6 @@
 #define _SHADOW_MAP_H
 
 
-
-typedef struct _SHADOW_MAP_TABLE{
-	ULONG_PTR	mapAddress;
-	ULONG		mapSize;
-	ULONG_PTR	realAddress;
-	ULONG		realSize;
-	DWORD		oldProtect;
-}SHADOW_MAP_TABLE, *PSHADOW_MAP_TABLE;
-
 /**
  * °²×°hook
  */
